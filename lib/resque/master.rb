@@ -95,7 +95,7 @@ module Resque
 
       Resque.setup do |forker|
         forker.options.verbose = options[:verbose] if options.key?(:verbose)
-        if options[:preload_app] && defined?(Rails)
+        if options[:preload_app] && available_for_require('rails')
           begin
             $:.unshift options[:runpath] # Makes 1.9.2 happy
             require options[:runpath] + "/config/environment"
@@ -232,6 +232,13 @@ module Resque
         :worker_processes => 1,
         :work_interval => 5
       }
+    end
+
+    def self.available_for_require(mod_file)
+      require mod_file
+      return true
+    rescue
+      return false
     end
 
   end
