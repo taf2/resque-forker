@@ -1,3 +1,4 @@
+require 'fcntl'
 require "logger"
 require "resque"
 require "syslog"
@@ -63,10 +64,29 @@ module Resque
   #   exec script/workers
   #   respawn
   class Forker
+    attr_reader :pid
+    attr_accessor :reexec_pid
+    # allow a USR2 + QUIT to upgrade without worker downtime...
+    # see: unicorn/lib/unicorn/http_server.rb
+    START_CTX = {
+      :argv => ARGV.map { |arg| arg.dup },
+      0 => $0.dup,
+    }
+    # We favor ENV['PWD'] since it is (usually) symlink aware for Capistrano
+    # and like systems
+    START_CTX[:cwd] = begin
+      a = File.stat(pwd = ENV['PWD'])
+      b = File.stat(Dir.pwd)
+      a.ino == b.ino && a.dev == b.dev ? pwd : Dir.pwd
+    rescue
+      Dir.pwd
+    end
 
-    Options = Struct.new(:verbose, :very_verbose, :interval, :terminate)
+
+    Options = Struct.new(:verbose, :very_verbose, :interval, :terminate, :pidfile)
 
     def initialize(options = nil)
+      self.reexec_pid = 0
       options ||= {}
       @logger = options[:logger] || Logger.new($stderr)
       @workload = options[:workload] || ["*"]
@@ -101,6 +121,11 @@ module Resque
       end
       reap_children
       @logger.info "** Forking workers"
+      self.pid = @options[:pidfile]
+      Resque.teardown do|forker|
+        File.unlink(pid) if pid && File.exist?(pid)
+      end
+      @logger.info "** Dropped pidfile: #$$ -> #{pid}"
       enable_gc_optimizations
       # Serious forking action.
       @workload.each do |queues|
@@ -131,6 +156,7 @@ module Resque
     def setup_signals
       # Stop gracefully
       trap :QUIT do
+        @logger.info "** Received Quit ..."
         stop
         exit
       end
@@ -143,11 +169,78 @@ module Resque
       trap :HUP do
         @logger.info "** Reincarnating ..."
         stop
-        exec $0, *ARGV
+        reexec
       end
       # Terminate quickly
       trap(:TERM) { shutdown! }
       trap(:INT) { shutdown! }
+    end
+
+    def pid=(path)
+      STDERR.puts "dropping pid to #{path}"
+      # TODO: should do more to be safe see unicorn
+      if path
+        begin
+          @logger.info "** dropping pid #$$ -> #{path} **"
+          fp = begin
+            tmp = "#{File.dirname(path)}/#{rand}.#$$"
+            File.open(tmp, File::RDWR|File::CREAT|File::EXCL, 0644)
+          rescue Errno::EEXIST
+            retry
+          end
+          fp.syswrite("#$$\n")
+          File.rename(fp.path, path)
+        ensure
+          fp.close if fp
+        end
+      end
+      @pid = path
+    end
+
+    # reexecutes the START_CTX with a new binary
+    # see: unicorn/lib/unicorn/http_server.rb#reexec
+    def reexec
+      if reexec_pid > 0
+        begin
+          Process.kill(0, reexec_pid)
+          STDERR.puts "reexec-ed child already running PID:#{reexec_pid}"
+          return
+        rescue Errno::ESRCH
+          reexec_pid = 0
+        end
+      end
+
+      if pid
+        old_pid = "#{pid}.oldbin"
+        begin
+          self.pid = old_pid  # clear the path for a new pid file
+        rescue ArgumentError
+          STDERR.puts "old PID:#{valid_pid?(old_pid)} running with " \
+                       "existing pid=#{old_pid}, refusing rexec"
+          return
+        rescue => e
+          STDERR.puts "error writing pid=#{old_pid} #{e.class} #{e.message}"
+          return
+        end
+      end
+
+      reexec_pid = fork do
+        Dir.chdir(START_CTX[:cwd])
+        cmd = [ START_CTX[0] ].concat(START_CTX[:argv])
+
+        # avoid leaking FDs we don't know about, but let before_exec
+        # unset FD_CLOEXEC, if anything else in the app eventually
+        # relies on FD inheritence.
+        (3..1024).each do |io|
+          #next if listener_fds.include?(io)
+          io = IO.for_fd(io) rescue next
+          io.fcntl(Fcntl::F_SETFD, Fcntl::FD_CLOEXEC)
+        end
+        STDOUT.puts "executing #{cmd.inspect} (in #{Dir.pwd})"
+        #before_exec.call(self)
+        exec(*cmd)
+      end
+      #proc_name 'master (old)'
     end
 
     # Enables GC Optimizations if you're running REE.

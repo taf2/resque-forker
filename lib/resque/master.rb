@@ -95,6 +95,7 @@ module Resque
 
       Resque.setup do |forker|
         forker.options.verbose = options[:verbose] if options.key?(:verbose)
+        forker.options.pidfile = options[:pidfile] if options.key?(:pidfile)
         if options[:preload_app] && available_for_require('rails')
           begin
             $:.unshift options[:runpath] # Makes 1.9.2 happy
@@ -108,13 +109,8 @@ module Resque
           end
         end
 
-        File.open(options[:pidfile],"wb") {|f| f << Process.pid } if options[:pidfile]
         forker.workload = options[:worker_queues] * options[:worker_processes].to_i if options[:worker_queues] && options[:worker_processes]
         forker.options.interval = options[:work_interval].to_i if options.key?(:work_interval)
-      end
-
-      Resque.teardown do|forker|
-        File.unlink(options[:pidfile]) if options[:pidfile] && File.exist?(options[:pidfile]) 
       end
 
       # register call backs
